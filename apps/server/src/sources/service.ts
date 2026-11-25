@@ -17,7 +17,7 @@ import { audit } from "../core/audit";
 import { notFound, validationError } from "../http/errors";
 import type { Actor } from "../auth/principal";
 import { runView } from "../runs/service";
-import { nextRunAfter, sourceStatus } from "./schedule";
+import { nextRunAfter, sourceProblem, sourceStatus } from "./schedule";
 
 export type SourceRow = typeof sources.$inferSelect;
 
@@ -167,6 +167,27 @@ export async function sourceViews(db: DbOrTx, rows: SourceRow[], now = new Date(
       },
     };
   });
+}
+
+/** Each source's problem for alerts and the heartbeat (`sourceProblem`), whatever runs now. */
+export async function sourceProblems(db: DbOrTx, rows: SourceRow[], now = new Date()) {
+  const { finished } = await runsBySource(
+    db,
+    rows.map((row) => row.id),
+  );
+  return new Map(
+    rows.map((row) => [
+      row.id,
+      sourceProblem({
+        enabled: row.enabled,
+        schedule: row.schedule,
+        createdAt: row.createdAt,
+        lastSuccessAt: row.lastSuccessAt,
+        lastFinished: finished.get(row.id) ?? null,
+        now,
+      }),
+    ]),
+  );
 }
 
 export async function listSourceRows(db: DbOrTx) {

@@ -142,6 +142,47 @@ describe("alerts", () => {
     }
   });
 
+  it("alerts on an overdue source while a backup of it waits in the queue", async () => {
+    const admin = await createUser();
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(req.url ?? "");
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/ping/abc`;
+    try {
+      await request("PUT", "/api/v1/notifications", {
+        userId: admin.id,
+        body: { email, heartbeatUrl: url, notifyRecovery: true },
+      });
+      await setUpTarget(admin);
+      const created = await request("POST", "/api/v1/sources", {
+        userId: admin.id,
+        body: {
+          kind: "app",
+          name: "Tickets",
+          schedule: { type: "daily", time: "02:00" },
+          retention: DEFAULT_RETENTION,
+        },
+      });
+      const sourceId = created.body.source.id as string;
+      // Never backed up since it was added ten days ago, and its run waits behind a long one.
+      await getDb()
+        .update(sources)
+        .set({ createdAt: new Date(Date.now() - 10 * 86_400_000) })
+        .where(eq(sources.id, sourceId));
+      await getDb().insert(runs).values({ kind: "backup", sourceId, trigger: "schedule", status: "queued" });
+      await checkAlerts(getDb());
+      expect((await mails()).map((mail) => mail.Subject)).toContain("[Backup] Backup is overdue: Tickets");
+      const [alerted] = await getDb().select().from(sources).where(eq(sources.id, sourceId));
+      expect(alerted!.alertState).toBe("overdue");
+      expect(hits).toEqual([]);
+    } finally {
+      server.close();
+    }
+  });
+
   it("calls the heartbeat only while all is well", async () => {
     const admin = await createUser();
     const hits: string[] = [];

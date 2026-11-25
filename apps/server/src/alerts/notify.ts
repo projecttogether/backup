@@ -18,8 +18,7 @@ import { readSetting, readSettingForUpdate, updateSetting, writeSetting } from "
 import { audit } from "../core/audit";
 import { isOperator, type Actor } from "../auth/principal";
 import { latestRun } from "../runs/service";
-import { listSourceRows, sourceViews } from "../sources/service";
-import { PROBLEM_STATUSES } from "../sources/schedule";
+import { listSourceRows, sourceProblems, sourceViews } from "../sources/service";
 import { readTarget } from "../target/target";
 import { smtpReply } from "./smtp-reply";
 
@@ -232,11 +231,12 @@ export async function checkAlerts(db: Db, now = new Date()) {
   const settings = await stored(db);
   const rows = await listSourceRows(db);
   const views = await sourceViews(db, rows, now);
+  // Not the displayed status: a queued or running backup must not hide a problem.
+  const problems = await sourceProblems(db, rows, now);
   let healthy = true;
   for (const view of views) {
     const row = rows.find((item) => item.id === view.id)!;
-    const problem =
-      PROBLEM_STATUSES.includes(view.status) && view.enabled ? (view.status as "failed" | "overdue") : null;
+    const problem = problems.get(view.id) ?? null;
     if (problem) healthy = false;
     if (problem && row.alertState !== problem) {
       const detail =

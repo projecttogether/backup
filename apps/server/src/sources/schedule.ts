@@ -44,5 +44,15 @@ export function sourceStatus(input: {
   return "ok";
 }
 
-/** Statuses that mean the admins should hear about it. */
-export const PROBLEM_STATUSES: SourceStatus[] = ["failed", "overdue"];
+/**
+ * What the admins should hear about (alerts, the heartbeat): an unresolved
+ * failure or an overdue backup of an enabled source, whatever runs now. A
+ * queued or running backup hides neither: one long run can keep the other
+ * sources waiting past their deadline.
+ */
+export function sourceProblem(
+  input: Omit<Parameters<typeof sourceStatus>[0], "active">,
+): "failed" | "overdue" | null {
+  const status = sourceStatus({ ...input, active: null });
+  return status === "failed" || status === "overdue" ? status : null;
+}

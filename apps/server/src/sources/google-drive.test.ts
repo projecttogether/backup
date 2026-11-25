@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { folderName, parseRcloneLog, remotesOf } from "./google-drive";
+import { folderName, parseRcloneLog, rclone, remotesOf } from "./google-drive";
 
 const key = JSON.stringify(
   { type: "service_account", client_email: "a@b.iam.gserviceaccount.com", private_key: "x" },
@@ -106,5 +106,10 @@ describe("Google Drive", () => {
       ],
       duplicates: ["Board/minutes.docx"],
     });
+  });
+
+  it("starts no rclone once the run is stopped", async () => {
+    // Stopped during an awaited step before: no abort event comes any more.
+    await expect(rclone(["version"], {}, AbortSignal.abort())).rejects.toMatchObject({ name: "AbortError" });
   });
 });

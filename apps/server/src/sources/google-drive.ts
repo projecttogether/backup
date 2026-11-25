@@ -115,6 +115,8 @@ export function rclone(
   signal?: AbortSignal,
 ): Promise<RcloneResult> {
   return new Promise((resolve, reject) => {
+    // An abort that came before (during an awaited step) fires no event: check it first.
+    signal?.throwIfAborted();
     const child = spawn(
       config().RCLONE_BINARY,
       [...args, "--config", "", "--use-json-log", "--log-level", "NOTICE"],

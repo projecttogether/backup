@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { overdueAfterMs, scheduleCron } from "@backup/shared/api/schedule";
-import { nextRunAfter, sourceStatus } from "./schedule";
+import { nextRunAfter, sourceProblem, sourceStatus } from "./schedule";
 
 describe("schedules", () => {
   it("turns schedules into cron expressions", () => {
@@ -62,5 +62,21 @@ describe("schedules", () => {
       }),
     ).toBe("never");
     expect(sourceStatus({ ...base, lastSuccessAt: null, active: null, lastFinished: null })).toBe("overdue");
+  });
+
+  it("finds a problem that a queued or running backup does not hide", () => {
+    const schedule = { type: "daily" as const, time: "02:00" };
+    const now = new Date("2026-11-20T12:00:00Z");
+    const base = { enabled: true, schedule, createdAt: new Date("2026-11-01T00:00:00Z"), now };
+    const old = new Date(now.getTime() - overdueAfterMs(schedule) - 1000);
+    const recent = new Date("2026-11-20T02:05:00Z");
+    const overdue = { ...base, lastSuccessAt: old, lastFinished: { status: "succeeded" as const } };
+    expect(sourceStatus({ ...overdue, active: { status: "queued" } })).toBe("queued");
+    expect(sourceProblem(overdue)).toBe("overdue");
+    const failed = { ...base, lastSuccessAt: recent, lastFinished: { status: "failed" as const } };
+    expect(sourceStatus({ ...failed, active: { status: "running" } })).toBe("running");
+    expect(sourceProblem(failed)).toBe("failed");
+    expect(sourceProblem({ ...base, lastSuccessAt: recent, lastFinished: { status: "warning" } })).toBeNull();
+    expect(sourceProblem({ ...overdue, enabled: false })).toBeNull();
   });
 });
