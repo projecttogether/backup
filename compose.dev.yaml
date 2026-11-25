@@ -44,7 +44,7 @@ services:
       - ./dev/keycloak:/opt/keycloak/data/import:ro
 
   s3:
-    image: rustfs/rustfs:1.0.5
+    image: rustfs/rustfs:1.0.6
     command: ["/data"]
     environment:
       RUSTFS_ACCESS_KEY: backups
@@ -60,7 +60,7 @@ services:
   # rules a target should have, as on Hetzner (docs/deployment.md). Governance
   # mode here, where compliance would keep test data for 30 days.
   s3-setup:
-    image: amazon/aws-cli:2.40.2
+    image: amazon/aws-cli:2.41.0
     depends_on: [s3]
     environment:
       AWS_ACCESS_KEY_ID: backups
@@ -78,7 +78,7 @@ services:
     restart: "no"
 
   mailpit:
-    image: axllent/mailpit:v1.33
+    image: axllent/mailpit:v1.34
     ports:
       - "127.0.0.1:8125:8025"
       - "127.0.0.1:1035:1025"
