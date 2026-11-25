@@ -1,0 +1,15 @@
+**/node_modules
+**/dist
+**/coverage
+.git
+.github
+.env
+.env.*
+!.env.example
+playwright-report
+test-results
+
+docs
+*.md
+# The backup agent has an image of its own (agent/Dockerfile).
+agent
