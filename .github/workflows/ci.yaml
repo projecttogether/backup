@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "26.13.0"
+  # The restic and rclone of the image (Dockerfile), for the integration tests.
+  RESTIC_VERSION: "0.19.1"
+  RESTIC_SHA256: f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+  # Not RCLONE_*: rclone reads those variables as its flags (RCLONE_VERSION is --version).
+  RCLONE_RELEASE: "1.76.0"
+  RCLONE_RELEASE_SHA256: b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7
+
+jobs:
+  secrets:
+    name: Secrets in the history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The CLI needs no license key or provider credentials.
+      - name: Install the pinned Gitleaks CLI
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+      # Every commit of the history, merge commits too, without showing what matched
+      # (.gitleaks.toml lists the repository's invented values).
+      - name: Scan the history
+        run: '"${{ runner.temp }}/gitleaks" git . --log-opts="--diff-merges=first-parent HEAD" --redact=100 --no-banner'
+
+  checks:
+    name: Lint, types, unit tests, build, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Check public repository contents
+        run: node scripts/check-public-repository.mjs
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - name: Migrations match the schema
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain apps/server/drizzle)" ]; then
+            git status --porcelain apps/server/drizzle
+            echo "The schema in apps/server/src/db/schema has changes without a migration. Run: npm run db:generate"
+            exit 1
+          fi
+      - run: npm run build
+      # What the image installs (Dockerfile, prod-deps).
+      - run: npm audit --omit=dev --omit=optional --audit-level=high
+
+  integration:
+    name: Integration tests (PostgreSQL 18, restic, S3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: PostgreSQL, S3 (with Object Lock) and Mailpit
+        run: docker compose -f compose.dev.yaml up -d postgres s3 s3-setup mailpit
+      - name: restic
+        run: |
+          curl -fsSL -o /tmp/restic.bz2 "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          echo "${RESTIC_SHA256}  /tmp/restic.bz2" | sha256sum -c -
+          bunzip2 /tmp/restic.bz2
+          sudo install -m 0755 /tmp/restic /usr/local/bin/restic
+          restic version
+      - name: rclone
+        run: |
+          curl -fsSL -o /tmp/rclone.zip "https://github.com/rclone/rclone/releases/download/v${RCLONE_RELEASE}/rclone-v${RCLONE_RELEASE}-linux-amd64.zip"
+          echo "${RCLONE_RELEASE_SHA256}  /tmp/rclone.zip" | sha256sum -c -
+          unzip -q /tmp/rclone.zip -d /tmp
+          sudo install -m 0755 "/tmp/rclone-v${RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
+      - run: npm ci --no-audit --no-fund
+      - name: Wait for the bucket
+        run: |
+          for _ in $(seq 1 60); do
+            [ "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' backups-dev-s3-setup-1)" = "exited 0" ] && exit 0
+            sleep 2
+          done
+          docker compose -f compose.dev.yaml logs s3 s3-setup
+          exit 1
+      - run: npm run test:integration
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILE: compose.yaml:compose.postgres.yaml
+      COMPOSE_PROJECT_NAME: backup-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      # The image built here, under the name compose.yaml runs, and fake settings.
+      BACKUP_IMAGE_TAG: ci
+      POSTGRES_PASSWORD: ci-only-password
+      DATABASE_URL: postgres://backups:ci-only-password@postgres:5432/backups
+      APP_URL: http://localhost:3000
+      AUTH_SECRET: ci-only-not-a-secret-ci-only-not-a-secret
+      ENCRYPTION_KEY: Y2ktb25seS1ub3QtYS1zZWNyZXQta2V5LTAwMDAwMDA=
+      OIDC_ISSUER: https://sso.example.invalid/realms/backup
+      OIDC_CLIENT_ID: backup
+      OIDC_CLIENT_SECRET: ci-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t ghcr.io/projecttogether/backup:ci --build-arg APP_VERSION=ci .
+      - name: The image runs as a non-root user
+        run: test "$(docker run --rm --entrypoint id ghcr.io/projecttogether/backup:ci -u)" = "1000"
+      - name: The image has restic, rclone and pg_dump 18
+        run: |
+          docker run --rm --entrypoint sh ghcr.io/projecttogether/backup:ci -c 'restic version && rclone version && $PG_DUMP_BINARY --version | grep -q " 18\."'
+      - name: The image has the operator command
+        run: |
+          docker run --rm ghcr.io/projecttogether/backup:ci cli help | grep -q "cli settings apply"
+          docker run --rm --entrypoint cli ghcr.io/projecttogether/backup:ci help | grep -q "cli settings apply"
+      - name: compose.yaml starts the migration, web and worker
+        run: |
+          docker compose up -d --wait --wait-timeout 180 web worker
+          docker compose exec -T web node -e "fetch('http://127.0.0.1:3000/-/readyz').then((r) => process.exit(r.ok ? 0 : 1))"
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove CI containers and volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  agent:
+    name: Backup agent (Go, end-to-end)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: agent/go.mod
+          cache: false # no dependencies
+      - name: Go format, vet and unit tests
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Not formatted with gofmt: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: Lint the shell script
+        run: shellcheck test/run.sh
+      # The image against PostgreSQL 18 and a fake Backup app: the received
+      # archive is checked with tar and restored with pg_restore.
+      - name: End-to-end test
+        run: test/run.sh

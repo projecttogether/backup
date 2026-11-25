@@ -1,0 +1,88 @@
+# Local development: PostgreSQL 18, a Keycloak with a development realm, an
+# S3-compatible storage (RustFS) as the target, and Mailpit for alert emails.
+#   docker compose -f compose.dev.yaml up -d
+# Keycloak: http://localhost:8114 (admin / admin), realm "backups", test
+# users with the password "backups-dev":
+#   ada@example.org    admin (ADMIN_EMAILS in .env.example)
+#   grace@example.org  group /backup-admins (ADMIN_GROUPS in .env.example)
+#   rita@example.org   no admin: refused at sign-in
+# S3 (RustFS): endpoint http://localhost:9114, console http://localhost:9115
+# (backups / backups-dev-secret); the bucket "backups" with Object Lock exists
+# after the first start.
+# Mailpit: http://localhost:8125 (SMTP on 1035).
+# The production setup is compose.yaml.
+name: backups-dev
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: backups
+      POSTGRES_PASSWORD: backups
+      POSTGRES_DB: backups
+    ports:
+      - "127.0.0.1:55460:5432"
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backups -d backups"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2-3
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # The image sizes the heap from host RAM (up to 70 %); cap it for local use.
+      JAVA_OPTS_KC_HEAP: "-Xms64m -Xmx512m"
+    ports:
+      - "127.0.0.1:8114:8080"
+    volumes:
+      - ./dev/keycloak:/opt/keycloak/data/import:ro
+
+  s3:
+    image: rustfs/rustfs:1.0.5
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: backups
+      RUSTFS_SECRET_KEY: backups-dev-secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9114:9000"
+      - "127.0.0.1:9115:9001"
+    volumes:
+      - s3:/data
+
+  # Creates the bucket "backups" with Object Lock (30 days) and the lifecycle
+  # rules a target should have, as on Hetzner (docs/deployment.md). Governance
+  # mode here, where compliance would keep test data for 30 days.
+  s3-setup:
+    image: amazon/aws-cli:2.40.2
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: backups
+      AWS_SECRET_ACCESS_KEY: backups-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://s3:9000
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do aws s3api list-buckets >/dev/null 2>&1 && break; sleep 1; done
+        aws s3api head-bucket --bucket backups 2>/dev/null && exit 0
+        aws s3api create-bucket --bucket backups --object-lock-enabled-for-bucket
+        aws s3api put-object-lock-configuration --bucket backups --object-lock-configuration '{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"GOVERNANCE","Days":30}}}'
+        aws s3api put-bucket-lifecycle-configuration --bucket backups --lifecycle-configuration '{"Rules":[{"ID":"old-versions","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":31},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}},{"ID":"delete-markers","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"ExpiredObjectDeleteMarker":true}}]}'
+    restart: "no"
+
+  mailpit:
+    image: axllent/mailpit:v1.33
+    ports:
+      - "127.0.0.1:8125:8025"
+      - "127.0.0.1:1035:1025"
+
+volumes:
+  postgres:
+  s3:
