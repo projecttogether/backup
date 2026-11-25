@@ -125,6 +125,7 @@ export async function runMaintenance(
   } catch (error) {
     warnings.push((error as Error).message);
   }
+  signal.throwIfAborted();
   await writeSetting(db, REPOSITORY_KEY, health);
 
   try {

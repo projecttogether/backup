@@ -7,7 +7,14 @@ import { runs, sources } from "../db/schema";
 import { resetConfigForTests } from "../config";
 import { createUser, eventually, request, resetDatabase, setUpTarget } from "../test/helpers";
 import { createRun } from "../runs/service";
-import { abortAllUploads, failOrphanedUploads, openUploadCount, resetStoppingForTests } from "./agent";
+import { getSourceRow } from "./service";
+import {
+  abortAllUploads,
+  failJob,
+  failOrphanedUploads,
+  openUploadCount,
+  resetStoppingForTests,
+} from "./agent";
 
 vi.mock("../auth/resolve", () => import("../test/resolve-mock"));
 
@@ -338,6 +345,53 @@ describe("the agent protocol, with restic and S3", () => {
       expect(run.log.join("\n")).toMatch(/The agent restarted during the upload; queued again/);
       await abortAllUploads();
       resetStoppingForTests();
+    });
+
+    it("lets no late request of the first attempt end the retry", async () => {
+      const admin = await createUser();
+      const { source, jobId } = await scheduledJob(admin.id);
+      // A `/fail` of the first attempt arrives, then waits (its client gave up after a minute)...
+      const arrived = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // ...while the agent asks again and gets the same run as a retry.
+      const poll = await request("POST", "/api/agent/v1/poll", { token: source.token, body: report });
+      expect(poll.body.job).toEqual({ id: jobId, partBytes: PART });
+      await failJob(getDb(), await getSourceRow(getDb(), source.id), jobId, "pg_dump failed", arrived);
+      expect(await runOf(jobId)).toMatchObject({ status: "running", trigger: "retry" });
+      const data = stream(PART + 10);
+      const parts = await upload(source.token, jobId, data);
+      const complete = await request("POST", `/api/agent/v1/jobs/${jobId}/complete`, {
+        token: source.token,
+        body: { parts, bytes: data.length, sha256: sha(data), warnings: [] },
+      });
+      expect(complete.status).toBe(202);
+      const done = await eventually(async () => {
+        const run = await runOf(jobId);
+        return run.status === "running" ? undefined : run;
+      }, 60_000);
+      expect(done).toMatchObject({ status: "succeeded", trigger: "retry" });
+    });
+
+    it("lets no late /fail end a retry that is still starting up", async () => {
+      const admin = await createUser();
+      await setUpTarget({ id: admin.id, email: "ada@example.org" });
+      const source = await appSource(admin.id);
+      const run = await createRun(getDb(), { kind: "backup", sourceId: source.id, trigger: "schedule" });
+      const row = await getSourceRow(getDb(), source.id);
+      const arrived = Date.now() - 60_000;
+      // Claimed again (running) after the request arrived, its upload not open yet.
+      await getDb()
+        .update(runs)
+        .set({ status: "running", trigger: "retry", startedAt: new Date() })
+        .where(eq(runs.id, run.id));
+      await failJob(getDb(), row, run.id, "pg_dump failed", arrived);
+      expect(await runOf(run.id)).toMatchObject({ status: "running" });
+      // A /fail of this attempt still ends it.
+      await failJob(getDb(), row, run.id, "pg_dump failed", Date.now());
+      expect(await runOf(run.id)).toMatchObject({
+        status: "failed",
+        error: "The agent reported: pg_dump failed",
+      });
     });
 
     it("queues a scheduled backup again when the agent was stopped (an update of the agent)", async () => {

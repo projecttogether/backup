@@ -1,5 +1,5 @@
 import { createHash, type Hash } from "node:crypto";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
 import {
   AGENT_STOPPED_MESSAGE,
   type AgentComplete,
@@ -61,6 +61,12 @@ type Session = {
   saving: Promise<void> | null;
   /** A restart ended the upload (interruptSession), which also ends its run. */
   interrupted: boolean;
+  /**
+   * When this attempt was claimed (`Date.now()`, as the run's `startedAt`). A retry keeps the
+   * run's ID, so a request that arrived before it (a late `/fail` or part of the earlier
+   * attempt) must not touch it.
+   */
+  startedAt: number;
 };
 
 const sessions = new Map<string, Session>();
@@ -89,6 +95,9 @@ async function stopSession(session: Session) {
 
 /** Stops an upload and ends its run (failed or cancelled) with `message`. */
 async function abortSession(session: Session, status: "failed" | "cancelled", message: string) {
+  // A restart interrupted it (interruptSession ends the run and may queue it again): a part
+  // whose write the stop cut short must not fail the run.
+  if (session.interrupted) return;
   await stopSession(session);
   await finishRun(getDb(), session.runId, { status, error: message });
   logger.info({ runId: session.runId, sourceId: session.sourceId, status }, "agent upload ended");
@@ -137,15 +146,18 @@ async function claimJob(db: Db, sourceId: string) {
       .limit(1)
       .for("update", { skipLocked: true });
     if (!run) return null;
+    // This process's clock, as the requests' arrival times: a late request of an earlier
+    // attempt is told apart by it (failJob), also before the session exists.
+    const startedAt = new Date();
     await tx
       .update(runs)
       .set({
         status: "running",
-        startedAt: sql`now()`,
+        startedAt,
         upload: { parts: 0, bytes: 0, lastActivityAt: new Date().toISOString() },
       })
       .where(eq(runs.id, run.id));
-    return run.id;
+    return { runId: run.id, startedAt: startedAt.getTime() };
   });
 }
 
@@ -179,8 +191,9 @@ export async function poll(db: Db, source: SourceRow, report: AgentPoll): Promis
       await interruptSession(session, "The agent restarted during the upload");
     }
   }
-  const runId = await claimJob(db, source.id);
-  if (!runId) return answer;
+  const claimed = await claimJob(db, source.id);
+  if (!claimed) return answer;
+  const { runId } = claimed;
   try {
     const repository = await openRepository(db);
     const backup = await startStreamBackup(repository, {
@@ -201,6 +214,7 @@ export async function poll(db: Db, source: SourceRow, report: AgentPoll): Promis
       queue: Promise.resolve(),
       saving: null,
       interrupted: false,
+      startedAt: claimed.startedAt,
     };
     sessions.set(runId, session);
     armTimer(session);
@@ -215,9 +229,12 @@ export async function poll(db: Db, source: SourceRow, report: AgentPoll): Promis
   }
 }
 
-function sessionOf(runId: string, source: SourceRow): Session {
+/** The open upload of `runId`; `receivedAt`: when the request arrived (`Date.now()`). */
+function sessionOf(runId: string, source: SourceRow, receivedAt: number): Session {
   const session = sessions.get(runId);
   if (!session || session.sourceId !== source.id || session.finishing) throw jobEnded();
+  // The request belongs to an earlier attempt of this run (it arrived before this one started).
+  if (receivedAt < session.startedAt) throw jobEnded();
   return session;
 }
 
@@ -229,8 +246,9 @@ export async function receivePart(
   part: number,
   sha256: string | undefined,
   body: Buffer,
+  receivedAt: number,
 ): Promise<void> {
-  const session = sessionOf(runId, source);
+  const session = sessionOf(runId, source, receivedAt);
   const digest = createHash("sha256").update(body).digest("hex");
   if (!sha256 || sha256.toLowerCase() !== digest) {
     throw new AppError(422, "checksum_mismatch", "The part arrived damaged; send it again");
@@ -269,10 +287,16 @@ async function storePart(db: Db, session: Session, part: number, digest: string,
 }
 
 /** `POST /jobs/:id/complete`: answers at once; restic finishes the snapshot in the background. */
-export async function completeJob(db: Db, source: SourceRow, runId: string, totals: AgentComplete) {
+export async function completeJob(
+  db: Db,
+  source: SourceRow,
+  runId: string,
+  totals: AgentComplete,
+  receivedAt: number,
+) {
   const done = completed.get(runId);
   if (done && done.sourceId === source.id && done.sha256 === totals.sha256) return;
-  const session = sessionOf(runId, source);
+  const session = sessionOf(runId, source, receivedAt);
   await session.queue;
   if (!sessions.has(runId) || session.finishing) throw jobEnded();
   const digest = session.total.copy().digest("hex");
@@ -318,8 +342,8 @@ export async function completeJob(db: Db, source: SourceRow, runId: string, tota
 }
 
 /** `POST /jobs/:id/progress`: the agent works on its stream (pg_dump) before the first part. */
-export async function recordJobProgress(db: Db, source: SourceRow, runId: string) {
-  const session = sessionOf(runId, source);
+export async function recordJobProgress(db: Db, source: SourceRow, runId: string, receivedAt: number) {
+  const session = sessionOf(runId, source, receivedAt);
   if (await isCancelRequested(db, runId)) {
     await abortSession(session, "cancelled", "Cancelled by an admin");
     throw jobEnded("The job was cancelled");
@@ -329,10 +353,12 @@ export async function recordJobProgress(db: Db, source: SourceRow, runId: string
 }
 
 /** `POST /jobs/:id/fail`: the agent could not produce its stream. */
-export async function failJob(db: Db, source: SourceRow, runId: string, message: string) {
+export async function failJob(db: Db, source: SourceRow, runId: string, message: string, receivedAt: number) {
   // `complete` was accepted (the answer may have been lost): the snapshot is being saved.
   if (completed.get(runId)?.sourceId === source.id) return;
   const session = sessions.get(runId);
+  // A late `/fail` of an earlier attempt (it arrived before the retry started): the retry goes on.
+  if (session && receivedAt < session.startedAt) return;
   // The agent was stopped, as for an update of the agent: a restart, not a failure of the backup.
   const stopped = message.trim() === AGENT_STOPPED_MESSAGE;
   const text = stopped
@@ -344,8 +370,13 @@ export async function failJob(db: Db, source: SourceRow, runId: string, message:
     else await abortSession(session, "failed", text);
     return;
   }
-  // No session (e.g. after a restart of this app): end the run if it still counts as running.
-  const ofThisJob = and(eq(runs.id, runId), eq(runs.sourceId, source.id))!;
+  // No session (e.g. after a restart of this app): end the run if it still counts as running,
+  // unless it was claimed again after this request arrived (a retry still starting up).
+  const ofThisJob = and(
+    eq(runs.id, runId),
+    eq(runs.sourceId, source.id),
+    lte(runs.startedAt, new Date(receivedAt)),
+  )!;
   if (stopped) {
     await endInterruptedRuns(db, ofThisJob, text);
     return;

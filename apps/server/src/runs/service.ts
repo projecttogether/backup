@@ -131,20 +131,25 @@ export async function finishRun(db: DbOrTx, runId: string, outcome: RunOutcome):
  */
 export async function endInterruptedRuns(db: DbOrTx, where: SQL, error: string): Promise<string[]> {
   const running = and(eq(runs.status, "running"), where);
-  await db
-    .update(runs)
-    .set({ status: "cancelled", finishedAt: sql`now()`, error: "Cancelled by an admin" })
-    .where(and(running, eq(runs.cancelRequested, true)));
-  const requeued = await db
-    .update(runs)
-    .set({ status: "queued", trigger: "retry", queuedAt: sql`now()`, startedAt: null, upload: null })
-    .where(and(running, eq(runs.trigger, "schedule")))
-    .returning({ id: runs.id });
+  // One transaction: a run queued again becomes claimable only once the others are ended, so
+  // an agent cannot claim it in between and see it failed by the last update.
+  const requeued = await db.transaction(async (tx) => {
+    await tx
+      .update(runs)
+      .set({ status: "cancelled", finishedAt: sql`now()`, error: "Cancelled by an admin" })
+      .where(and(running, eq(runs.cancelRequested, true)));
+    const queued = await tx
+      .update(runs)
+      .set({ status: "queued", trigger: "retry", queuedAt: sql`now()`, startedAt: null, upload: null })
+      .where(and(running, eq(runs.trigger, "schedule")))
+      .returning({ id: runs.id });
+    await tx
+      .update(runs)
+      .set({ status: "failed", finishedAt: sql`now()`, error: error.slice(0, 1000) })
+      .where(running);
+    return queued;
+  });
   for (const run of requeued) await appendLog(db, run.id, `${error}; queued again`);
-  await db
-    .update(runs)
-    .set({ status: "failed", finishedAt: sql`now()`, error: error.slice(0, 1000) })
-    .where(running);
   return requeued.map((run) => run.id);
 }
 
